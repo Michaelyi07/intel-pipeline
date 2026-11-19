@@ -1,7 +1,6 @@
 """One-command demo: run a fictional entry through the pipeline and print the ledger.
 
-Uses an in-memory SQLite-compatible flow only when DATABASE_URL is unset? No —
-this demo requires a real PostgreSQL (DATABASE_URL), consistent with the tests.
+Requires a real PostgreSQL via DATABASE_URL (consistent with the tests — no SQLite).
 It prints the full intel_item_steps ledger for visual inspection.
 """
 

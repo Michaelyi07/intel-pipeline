@@ -3,7 +3,9 @@
 Ticket rules:
 - The queue uses Redis; worker concurrency is controlled via environment variables.
 - When the model gateway is unavailable, the whole queue pauses (no items pulled,
-  no per-item failures). Processing resumes automatically after recovery.
+  no per-item failures). Resuming requires clearing the Redis pause flag once the
+  gateway is healthy again (see ADR-002: the flag clear is a deliberate manual /
+  health-probe-driven action, not automatic).
 """
 
 from __future__ import annotations

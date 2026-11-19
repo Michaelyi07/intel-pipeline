@@ -10,10 +10,6 @@ from app.steps import LinkGateDrop, RepostDetected
 from tests.conftest import make_item
 
 
-def steps_for(item_id):
-    return None  # placeholder replaced below
-
-
 def _rows(session, item_id):
     return session.execute(
         select(IntelItemStep)
@@ -28,7 +24,6 @@ def _rows(session, item_id):
 
 def test_happy_path_all_steps_succeed_in_check(session, orchestrator, tenant, gateway):
     item = make_item(session, tenant)
-    link_score_setter = item  # link_score default passes threshold
     result = orchestrator.process_item(item.id)
 
     assert result.status == "in_check"
