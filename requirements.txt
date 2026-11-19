@@ -1,0 +1,8 @@
+# Intel pipeline service — runtime (Python 3.11+)
+fastapi>=0.115,<1
+uvicorn>=0.30
+sqlalchemy>=2.0,<3
+psycopg[binary]>=3.2
+pydantic>=2.7
+alembic>=1.13
+redis>=5.0
