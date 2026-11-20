@@ -48,10 +48,25 @@ Rules implemented:
 3. Model steps (redact, tag, summarize, conditions, match) auto-retry twice with
    1 min / 5 min backoff; on final failure the item status is `processing_failed`.
 4. `POST /api/intel/items/{id}/reprocess` re-runs an item starting from the first
-   non-success step; completed steps are not re-executed.
+   non-`succeeded` step; completed steps are not re-executed.
 5. When the model gateway is unavailable, the whole Redis queue pauses (no items
-   pulled, no per-item failures); processing resumes after recovery.
-6. Worker concurrency is controlled via `INTEL_WORKER_CONCURRENCY`.
+   pulled, no per-item failures). This holds in two situations: (a) the gateway
+   is already down when the worker cycle starts — nothing is pulled; (b) the
+   gateway goes down while an item is being processed — the orchestrator raises
+   `GatewayUnavailableError` (distinct from ordinary failures: no retry/backoff
+   burn, no skipped markers), the item is requeued in a resumable state
+   (`pending`, completed steps keep their `succeeded` rows) and the queue pauses.
+   Recovery is automatic: the worker mirrors gateway health into the Redis pause
+   flag in both directions, so once the gateway is healthy again the flag is
+   cleared and processing resumes on the next cycle — no manual action.
+6. Worker concurrency is real parallelism: up to `INTEL_WORKER_CONCURRENCY`
+   items are processed concurrently in a thread pool (each task gets its own
+   orchestrator/session from the injected factory).
+7. Dedup is exact + near-duplicate: identical normalized text, or character
+   5-gram shingle Jaccard similarity at or above
+   `INTEL_DEDUP_SIMILARITY_THRESHOLD` (default 0.85), counts as a repost.
+
+Step statuses in `intel_item_steps.status`: `succeeded | failed | skipped`.
 
 ## Repo layout
 
@@ -82,7 +97,7 @@ export DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5433/intel_
 # apply the migration (Alembic; or psql -f migrations/001_intel_item_steps.sql)
 alembic -x db_url="$DATABASE_URL" upgrade head
 
-pytest tests -v          # 18 tests against real PostgreSQL — no SQLite, no DB-layer mocks
+pytest tests -v          # 23 tests against real PostgreSQL — no SQLite, no DB-layer mocks
 python scripts/smoke_demo.py   # end-to-end fictional entry demo
 ```
 
@@ -98,15 +113,20 @@ Env vars (see `.env.example`):
 | `MODEL_GATEWAY_URL` / `MODEL_GATEWAY_TIMEOUT_SECONDS` | stub endpoint / 10 | gateway client config |
 | `MODEL_RETRY_MAX_ATTEMPTS` | `3` | 1 initial + 2 retries |
 | `INTEL_LINK_CHECK_MIN_SCORE` | `60` | original-link threshold |
+| `INTEL_DEDUP_SIMILARITY_THRESHOLD` | `0.85` | near-duplicate shingle-Jaccard threshold (0–1] |
 
 ## Integration points (dependency stubs, per the brief)
 
 - **Model gateway** — `app/steps.py::ModelGateway` is the stub. The real gateway
   ticket replaces `invoke()` (or sets `MODEL_GATEWAY_URL` against an HTTP client).
+  Unavailability must surface as `GatewayUnavailableError` (a `ConnectionError`
+  subclass) so the queue-pause rule applies; ordinary invocation errors retry
+  with backoff and eventually mark the item `processing_failed`.
 - **Crawler ticket** — sets `intel_items.link_score` (original-link threshold score)
   and `source_url` when enqueuing a captured page.
-- **Dedup store** — `Orchestrator(known_fingerprints=...)` accepts the seen-fingerprint
-  set; the dedup ticket swaps in a real store behind the same interface.
+- **Dedup store** — `Orchestrator(known_fingerprints=...)` accepts the seen-text
+  set (each element is the normalized text of a seen item); the dedup ticket
+  swaps in a real store behind the same set-like interface.
 - **Workbench/IAM** — `app/api.py` reads tenant headers (`X-Org-Id`/`X-Site-Id`) from
   the trusted gateway; every lookup is tenant-scoped (cross-tenant item → 404).
 - **Alembic chain** — revision `20261119_iip_001` upgrades/downgrades cleanly in the

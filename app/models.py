@@ -67,7 +67,7 @@ class IntelItemStep(Base, TimestampMixin):
     site_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False, index=True)
 
     step: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    # success | failed | skipped
+    # succeeded | failed | skipped
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)

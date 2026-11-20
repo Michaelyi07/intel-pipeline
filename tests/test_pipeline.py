@@ -29,7 +29,7 @@ def test_happy_path_all_steps_succeed_in_check(session, orchestrator, tenant, ga
     assert result.status == "in_check"
     rows = _rows(session, item.id)
     assert [r.step for r in rows] == list(STEPS), "exactly 11 step rows in declared order"
-    assert all(r.status == "success" for r in rows)
+    assert all(r.status == "succeeded" for r in rows)
     assert all(r.attempt == 1 for r in rows)
     assert all(r.error_code is None for r in rows)
     assert all(r.duration_ms >= 0 for r in rows)
@@ -67,16 +67,19 @@ def test_happy_path_model_steps_called_exactly_once(session, orchestrator, tenan
 # A2: repost ends after dedup with zero model calls
 # ---------------------------------------------------------------------------
 
+def _normalized_body(payload: str) -> str:
+    """Replicate extract+normalize the same way the steps do (for seeding fingerprints)."""
+    import re
+    body = re.sub(r"<[^>]+>", "", payload).strip()
+    return re.sub(r"(\d{4})年(\d{1,2})月(\d{1,2})日", r"\1-\2-\3", body)
+
+
 def test_repost_ends_at_dedup_zero_model_calls(session, orchestrator, tenant, gateway,
                                                known_fingerprints):
-    from app.steps import normalize_step  # fingerprint built the same way the step does
-
     item = make_item(session, tenant)
-    # Seed the seen-fingerprint set with this item's normalized text prefix
-    import re
-    body = re.sub(r"<[^>]+>", "", item.payload).strip()
-    body = re.sub(r"(\d{4})年(\d{1,2})月(\d{1,2})日", r"\1-\2-\3", body)
-    known_fingerprints.add(body[:200])
+    # Seed the seen set with the EXACT normalized text of this item (fingerprint
+    # = full normalized text, same representation the dedup step compares).
+    known_fingerprints.add(_normalized_body(item.payload))
 
     result = orchestrator.process_item(item.id)
 
@@ -85,7 +88,7 @@ def test_repost_ends_at_dedup_zero_model_calls(session, orchestrator, tenant, ga
     rows = _rows(session, item.id)
     assert [r.step for r in rows] == list(STEPS), \
         "full ledger: flow ends at dedup; remaining steps recorded skipped"
-    assert [r.status for r in rows[:3]] == ["success", "success", "success"]
+    assert [r.status for r in rows[:3]] == ["succeeded", "succeeded", "succeeded"]
     assert all(r.status == "skipped" for r in rows[3:]), "no step beyond dedup executed"
     assert gateway.call_count() == 0, "no model stub call for a repost"
 
@@ -97,21 +100,56 @@ def test_unique_item_passes_dedup(session, orchestrator, tenant, gateway):
     assert gateway.call_count() == len(MODEL_STEPS)
 
 
+LONG_BODY = (
+    "虚构情报正文：示例机构发布关于区域市场的观察声明，涉及渠道库存、价格带与"
+    "终端动销的季度变化，供内部测试使用，不指向任何真实主体。"
+) * 4  # long enough for stable shingle statistics
+
+
 def test_near_duplicate_above_threshold_is_repost(session, orchestrator, tenant,
                                                   known_fingerprints):
-    """Edge promised in the bid: near-duplicate above similarity threshold behaves
-    like an exact repost (stub judges on the normalized fingerprint)."""
-    item = make_item(session, tenant)
-    import re
-    body = re.sub(r"<[^>]+>", "", item.payload).strip()
-    near = body[:180] + " xx"  # above near-dup threshold; stub fingerprints by prefix
-    body_norm = re.sub(r"(\d{4})年(\d{1,2})月(\d{1,2})日", r"\1-\2-\3", body)
-    known_fingerprints.add(body_norm[:200])
-    known_fingerprints.add(near[:200])
+    """Near-duplicate similarity detection: the seen set contains ONLY a lightly
+    edited variant of the text (no exact match), and the shingle-Jaccard
+    similarity (>= INTEL_DEDUP_SIMILARITY_THRESHOLD) still flags it as a repost."""
+    item = make_item(session, tenant, payload=f"<p>{LONG_BODY}</p>")
+    body = _normalized_body(item.payload)
+    near = body.replace("渠道库存", "渠道备货", 1)  # lightly edited variant
+    assert near != body, "seed must not accidentally be the exact text"
+    known_fingerprints.add(near)  # near fingerprint ONLY — no exact fingerprint
 
     result = orchestrator.process_item(item.id)
     assert result.status == "discarded"
     assert result.last_error_code == "repost"
+
+
+def test_below_threshold_similar_text_passes_dedup(session, orchestrator, tenant,
+                                                   known_fingerprints, gateway):
+    """A genuinely different text must NOT be dropped by the near-duplicate gate."""
+    item = make_item(session, tenant, payload=f"<p>{LONG_BODY}</p>")
+    body = _normalized_body(item.payload)
+    other = "完全不同的一段虚构文本：今日天气晴朗，适合户外活动与采风记录。"
+    assert other not in known_fingerprints
+    known_fingerprints.add(other)
+
+    result = orchestrator.process_item(item.id)
+    assert result.status == "in_check", "dissimilar text passes the near-duplicate gate"
+    assert gateway.call_count() == len(MODEL_STEPS)
+
+
+def test_dedup_threshold_from_env(monkeypatch):
+    import importlib
+    import app.config as config
+
+    monkeypatch.setenv("INTEL_DEDUP_SIMILARITY_THRESHOLD", "0.95")
+    importlib.reload(config)
+    assert config.DEDUP_SIMILARITY_THRESHOLD == 0.95
+    monkeypatch.setenv("INTEL_DEDUP_SIMILARITY_THRESHOLD", "bogus")
+    with pytest.raises(RuntimeError):
+        importlib.reload(config)
+    # restore the default for subsequent config consumers
+    monkeypatch.delenv("INTEL_DEDUP_SIMILARITY_THRESHOLD")
+    importlib.reload(config)
+    assert config.DEDUP_SIMILARITY_THRESHOLD == 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +165,7 @@ def test_link_gate_drop_ends_at_link_check(session, orchestrator, tenant, gatewa
     rows = _rows(session, item.id)
     assert [r.step for r in rows] == list(STEPS)
     link_idx = STEPS.index("link_check")
-    assert all(r.status == "success" for r in rows[: link_idx + 1])
+    assert all(r.status == "succeeded" for r in rows[: link_idx + 1])
     assert all(r.status == "skipped" for r in rows[link_idx + 1 :])
     # model steps tag/summarize/conditions/match never called
     assert gateway.call_count("tag") == 0
@@ -159,5 +197,5 @@ def test_step_failure_stops_chain(session, orchestrator, tenant, gateway):
     assert rows[0].step == "extract" and rows[0].status == "failed"
     assert rows[0].error_code == "ValueError"
     assert all(r.status == "skipped" for r in rows[1:]), "chain stopped: no step executed"
-    assert not [r for r in rows if r.status == "success" and r.step != "extract"]
+    assert not [r for r in rows if r.status == "succeeded" and r.step != "extract"]
     assert gateway.call_count() == 0, "no downstream step ran"

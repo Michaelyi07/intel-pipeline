@@ -13,14 +13,20 @@ down_revision = None
 branch_labels = None
 depends_on = None
 
-UNIFIED_COLUMNS = [
-    sa.Column("org_id", sa.Uuid(), nullable=False),
-    sa.Column("site_id", sa.Uuid(), nullable=False),
-    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-    sa.Column("created_by", sa.String(64), nullable=True),
-    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-    sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
-]
+def _unified_columns() -> list:
+    """Fresh Column instances per call.
+
+    A sa.Column object must not be reused across op.create_table calls —
+    sharing one instance between tables corrupts the second table's DDL.
+    """
+    return [
+        sa.Column("org_id", sa.Uuid(), nullable=False),
+        sa.Column("site_id", sa.Uuid(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("created_by", sa.String(64), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
+    ]
 
 
 def upgrade() -> None:
@@ -33,7 +39,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(32), nullable=False, server_default="pending"),
         sa.Column("last_error_code", sa.String(64), nullable=True),
         sa.Column("payload", sa.Text(), nullable=True),
-        *UNIFIED_COLUMNS,
+        *_unified_columns(),
     )
     op.create_index("ix_intel_items_org_id", "intel_items", ["org_id"])
     op.create_index("ix_intel_items_site_id", "intel_items", ["site_id"])
@@ -53,7 +59,7 @@ def upgrade() -> None:
         sa.Column("attempt", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("error_code", sa.String(64), nullable=True),
         sa.Column("duration_ms", sa.Integer(), nullable=False, server_default="0"),
-        *UNIFIED_COLUMNS,
+        *_unified_columns(),
     )
     op.create_index("ix_intel_item_steps_item_id", "intel_item_steps", ["item_id"])
     op.create_index("ix_intel_item_steps_org_id", "intel_item_steps", ["org_id"])

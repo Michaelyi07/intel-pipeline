@@ -15,6 +15,19 @@ def _int_env(name: str, default: int) -> int:
         raise RuntimeError(f"env var {name} must be an integer, got {raw!r}") from None
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise RuntimeError(f"env var {name} must be a float, got {raw!r}") from None
+    if not 0.0 < value <= 1.0:
+        raise RuntimeError(f"env var {name} must be in (0, 1], got {raw!r}")
+    return value
+
+
 # PostgreSQL 16 connection URL (psycopg 3 driver)
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -40,3 +53,7 @@ QUEUE_PAUSED_KEY = "intel:queue:paused"
 
 # Link_check threshold: item without a qualifying original link is dropped at that step
 LINK_CHECK_MIN_SCORE = _int_env("INTEL_LINK_CHECK_MIN_SCORE", 60)
+
+# Near-duplicate (dedup) similarity threshold: shingle-Jaccard similarity at or
+# above this value counts as a repost. Read from the environment per ticket rule.
+DEDUP_SIMILARITY_THRESHOLD = _float_env("INTEL_DEDUP_SIMILARITY_THRESHOLD", 0.85)

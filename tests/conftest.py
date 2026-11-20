@@ -93,8 +93,16 @@ def queue(redis_client):
 
 
 @pytest.fixture
-def worker(queue, orchestrator, gateway):
-    return Worker(queue, lambda: orchestrator, gateway, concurrency=2)
+def worker(queue, session_factory, gateway, registry, known_fingerprints):
+    # Thread-safe factory: the worker processes items concurrently in a thread
+    # pool, so each task gets its own orchestrator bound to its own Session.
+    def factory():
+        return Orchestrator(
+            session_factory(), registry, sleep=lambda _s: None,
+            known_fingerprints=known_fingerprints,
+        )
+
+    return Worker(queue, factory, gateway, concurrency=2)
 
 
 def make_item(session, tenant, payload="<p>虚构测试情报正文 FICT-001</p>",

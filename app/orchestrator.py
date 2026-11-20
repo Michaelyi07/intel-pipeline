@@ -6,7 +6,11 @@ Rules implemented (ticket S5-INTEL-023):
 - Repost (dedup) or link-gate drop ends the flow at the corresponding step.
 - Model steps auto-retry twice with 1 min / 5 min backoff; on final failure the
   item status becomes processing_failed.
-- Reprocess resumes from the first non-success step (failed/skipped ones rerun).
+- Reprocess resumes from the first non-succeeded step (failed/skipped ones rerun).
+- Gateway-unavailable (GatewayUnavailableError) is NOT an ordinary failure: the
+  item is returned to a resumable state (status pending, no retry burn, no
+  skipped markers) and the orchestrator signals the worker to pause the queue
+  via `pause_requested`.
 
 The clock is injectable (`sleep` callable) so tests verify backoff without waiting.
 """
@@ -21,6 +25,7 @@ from typing import Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import config
 from .config import LINK_CHECK_MIN_SCORE, MODEL_RETRY_BACKOFF_SECONDS, MODEL_RETRY_MAX_ATTEMPTS
 from .models import (
     MODEL_STEPS,
@@ -30,6 +35,7 @@ from .models import (
     utcnow,
 )
 from .steps import (
+    GatewayUnavailableError,
     LinkGateDrop,
     RepostDetected,
     StepContext,
@@ -49,6 +55,10 @@ class Orchestrator:
         self.session = session
         self.registry = step_registry
         self.sleep = sleep
+        # Set while processing when the gateway turns unavailable mid-item; the
+        # worker reads this after each batch to pause the queue and requeue the
+        # affected item (kept resumable, never counted as failed).
+        self.pause_requested = False
         # Explicit None check: `set() or set()` would silently copy and break identity
         # for an empty seeded set (tests seed fingerprints after construction).
         self.known_fingerprints = known_fingerprints if known_fingerprints is not None else set()
@@ -88,7 +98,7 @@ class Orchestrator:
             )
             .order_by(IntelItemStep.created_at, IntelItemStep.id)
         ).scalars().all()
-        succeeded = {r.step for r in rows if r.status == "success"}
+        succeeded = {r.step for r in rows if r.status == "succeeded"}
         for idx, step in enumerate(STEPS):
             if step not in succeeded:
                 return idx
@@ -102,6 +112,7 @@ class Orchestrator:
         if item is None or item.deleted_at is not None:
             raise ValueError(f"intel item {item_id} not found")
 
+        self.pause_requested = False
         if item.status in ("processing_failed", "pending", "processing"):
             start_idx = self._first_pending_step(item_id)
         elif item.status == "in_check":
@@ -119,6 +130,8 @@ class Orchestrator:
         ctx.data["known_fingerprints"] = self.known_fingerprints
         ctx.data["link_score"] = item.link_score
         ctx.data["link_check_min_score"] = LINK_CHECK_MIN_SCORE
+        # Runtime read (not import-time) so env-var overrides via reload work in tests.
+        ctx.data["dedup_similarity_threshold"] = config.DEDUP_SIMILARITY_THRESHOLD
 
         for idx in range(start_idx, len(STEPS)):
             step_name = STEPS[idx]
@@ -133,11 +146,11 @@ class Orchestrator:
                 try:
                     self.registry[step_name](ctx)
                     duration_ms = int((utcnow() - started).total_seconds() * 1000)
-                    self._record_step(item, step_name, "success", attempt, None, duration_ms)
+                    self._record_step(item, step_name, "succeeded", attempt, None, duration_ms)
                     step_done = True
                 except RepostDetected as exc:
                     duration_ms = int((utcnow() - started).total_seconds() * 1000)
-                    self._record_step(item, step_name, "success", attempt, None, duration_ms)
+                    self._record_step(item, step_name, "succeeded", attempt, None, duration_ms)
                     self._mark_skipped(item, STEPS[idx + 1 :])
                     item.status = "discarded"
                     item.last_error_code = exc.error_code
@@ -146,12 +159,28 @@ class Orchestrator:
                     return item
                 except LinkGateDrop as exc:
                     duration_ms = int((utcnow() - started).total_seconds() * 1000)
-                    self._record_step(item, step_name, "success", attempt, None, duration_ms)
+                    self._record_step(item, step_name, "succeeded", attempt, None, duration_ms)
                     self._mark_skipped(item, STEPS[idx + 1 :])
                     item.status = "discarded"
                     item.last_error_code = exc.error_code
                     self.session.commit()
                     logger.info("link gate drop item=%s at step=%s", item.id, step_name)
+                    return item
+                except GatewayUnavailableError as exc:
+                    # Ticket rule: gateway unavailability pauses the whole queue,
+                    # it is not a per-item failure. Keep the item resumable
+                    # (status pending, completed steps stay succeeded, no skipped
+                    # markers, no retry/backoff burn) and let the worker pause.
+                    duration_ms = int((utcnow() - started).total_seconds() * 1000)
+                    self._record_step(item, step_name, "failed", attempt, exc.error_code, duration_ms)
+                    item.status = "pending"
+                    item.last_error_code = exc.error_code
+                    self.pause_requested = True
+                    self.session.commit()
+                    logger.info(
+                        "gateway unavailable item=%s at step=%s; queue pause requested",
+                        item.id, step_name,
+                    )
                     return item
                 except Exception as exc:  # noqa: BLE001 — step boundary, classify below
                     duration_ms = int((utcnow() - started).total_seconds() * 1000)

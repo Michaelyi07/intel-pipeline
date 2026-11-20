@@ -27,6 +27,17 @@ class RepostDetected(Exception):
     error_code = "repost"
 
 
+class GatewayUnavailableError(ConnectionError):
+    """The model gateway is unreachable.
+
+    Distinct from ordinary step failures: the orchestrator treats this as a
+    queue-level pause condition (item stays resumable, no retry/backoff burn),
+    per the ticket rule "the whole queue pauses rather than failing item by item".
+    """
+
+    error_code = "gateway_unavailable"
+
+
 @dataclass
 class StepContext:
     """State carried through the pipeline. `data` accumulates step outputs."""
@@ -59,12 +70,46 @@ def normalize_step(ctx: StepContext) -> None:
 
 
 def dedup_step(ctx: StepContext) -> None:
-    # Exact and near-duplicate detection. Stub compares against the seen-fingerprint set
-    # injected into ctx.data["known_fingerprints"] by the caller (integration point).
+    # Exact + near-duplicate detection against the seen-fingerprint set injected
+    # into ctx.data["known_fingerprints"] by the caller (integration point: the
+    # dedup ticket swaps in a real store behind the same set-like interface).
+    #
+    # Fingerprints store the normalized text of each seen item.
+    # - Exact match: identical normalized text -> repost.
+    # - Near-duplicate: character-shingle (5-gram) Jaccard similarity of the
+    #   normalized texts at or above ctx.data["dedup_similarity_threshold"]
+    #   (from INTEL_DEDUP_SIMILARITY_THRESHOLD, default 0.85) -> repost.
     fingerprints: set[str] = ctx.data.get("known_fingerprints", set())
-    fp = ctx.data["normalized_text"][:200]
-    if fp in fingerprints:
+    if not fingerprints:
+        return
+    text = ctx.data["normalized_text"]
+    threshold = float(ctx.data.get("dedup_similarity_threshold", _DEFAULT_SIMILARITY_THRESHOLD))
+    if text in fingerprints:
         raise RepostDetected()
+    shingles = _shingles(text)
+    for seen_text in fingerprints:
+        if _jaccard(shingles, _shingles(seen_text)) >= threshold:
+            raise RepostDetected()
+
+
+# Character n-gram shingle Jaccard similarity for near-duplicate judgement.
+_SHINGLE_K = 5
+_DEFAULT_SIMILARITY_THRESHOLD = 0.85  # fallback; runtime value comes from config/env
+
+
+def _shingles(text: str, k: int = _SHINGLE_K) -> set[str]:
+    if not text:
+        return set()
+    if len(text) < k:
+        return {text}
+    return {text[i : i + k] for i in range(len(text) - k + 1)}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 1.0
+    union = a | b
+    return len(a & b) / len(union) if union else 1.0
 
 
 def link_check_step(ctx: StepContext) -> None:
@@ -121,7 +166,7 @@ class ModelGateway:
 
     def invoke(self, step_name: str, data: dict[str, Any]) -> str:
         if self._unavailable:
-            raise ConnectionError("model gateway unavailable")
+            raise GatewayUnavailableError("model gateway unavailable")
         self.calls.append((step_name, len(self.calls)))
         return f"{step_name}-ok"
 
